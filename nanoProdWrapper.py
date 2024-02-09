@@ -50,8 +50,10 @@ cond_mc = {
   'Run2_2016': 'auto:run2_mc',
   'Run2_2017': 'auto:phase1_2017_realistic',
   'Run2_2018': 'auto:phase1_2018_realistic',
-  'Run3_2022': '126X_mcRun3_2022_realistic_v2',
-  'Run3_2022EE': '126X_mcRun3_2022_realistic_postEE_v1',
+  # 'Run3_2022': '126X_mcRun3_2022_realistic_v2',
+  # 'Run3_2022EE': '126X_mcRun3_2022_realistic_postEE_v1',
+  'Run3_2022': '130X_mcRun3_2022_realistic_v5',
+  'Run3_2022EE': '130X_mcRun3_2022_realistic_postEE_v6',
 }
 
 if options.era.startswith('Run2'):
@@ -60,13 +62,15 @@ if options.era.startswith('Run2'):
   era_mod = ',run2_nanoAOD_106Xv2'
 elif options.era.startswith('Run3'):
   cond_data_run3 = {
-    'Run3_2022CDE': '124X_dataRun3_v14',
-    'Run3_2022FG': '124X_dataRun3_Prompt_v10',
+    'Run3_2022CDE': '130X_dataRun3_v2',
+    'Run3_2022FG': '130X_dataRun3_PromptAnalysis_v1',
   }
   if options.sampleType == 'data':
     cond_data = cond_data_run3[options.era]
   era_str = 'Run3'
-  era_mod = ',run3_nanoAOD_124'
+  # era_mod = ',run3_nanoAOD_124'
+  # No era modifier needed for miniAOD v4 (https://gitlab.cern.ch/cms-nanoAOD/nanoaod-doc/-/wikis/Instructions/Private-production)
+  era_mod = ''
 else:
   raise RuntimeError(f'Unknown era = "{options.era}"')
 
