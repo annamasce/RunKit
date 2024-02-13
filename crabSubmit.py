@@ -26,7 +26,7 @@ def submit(task: Task):
   config.JobType.psetName = task.cmsswPython
   config.JobType.maxMemoryMB = task.getMaxMemory()
   config.JobType.numCores = task.numCores
-  config.JobType.sendPythonFolder = True
+  # config.JobType.sendPythonFolder = True
 
   if len(task.scriptExe) > 0:
     config.JobType.scriptExe = task.scriptExe
