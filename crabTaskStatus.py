@@ -6,14 +6,15 @@ class Status(Enum):
   Unknown = -1
   Defined = 0
   Submitted = 1
-  Bootstrapped = 2
-  TapeRecall = 3
-  InProgress = 4
-  WaitingForRecovery = 5
-  WaitingForLocalRecovery = 6
-  CrabFinished = 7
-  PostProcessingFinished = 8
-  Failed = 9
+  SubmittedToLocal = 2
+  Bootstrapped = 3
+  TapeRecall = 4
+  InProgress = 5
+  WaitingForRecovery = 6
+  WaitingForLocalRecovery = 7
+  CrabFinished = 8
+  PostProcessingFinished = 9
+  Failed = 10
 
 class StatusOnServer(Enum):
   QUEUED = 1
@@ -22,8 +23,10 @@ class StatusOnServer(Enum):
   KILLED = 4
   SUBMITFAILED = 5
   RESUBMITFAILED = 6
+  KILLFAILED = 7
 
 class StatusOnScheduler(Enum):
+  WAITING_FOR_BOOTSTRAP = 0
   SUBMITTED = 1
   FAILED = 2
   FAILED_KILLED = 3
@@ -40,6 +43,7 @@ class CrabFailureCategory(Enum):
   CannotLocateFile = 1
 
 class JobStatus(Enum):
+  unknown = -1
   unsubmitted = 0
   idle = 1
   cooloff = 2
@@ -53,7 +57,7 @@ class JobStatus(Enum):
 
 class CrabWarning:
   known_warnings = {
-    r"Some blocks from dataset '.+' were skipped  because they are only present at blacklisted and/or not-whitelisted sites.": CrabWarningCategory.BlocksSkipped,
+    r"Some blocks from dataset '.+' were skipped  because they are only present at blacklisted, not-whitelisted, and/or non-accelerator sites.": CrabWarningCategory.BlocksSkipped,
     r"the max jobs runtime is less than 30% of the task requested value": CrabWarningCategory.ShortRuntime,
     r"the average jobs CPU efficiency is less than 50%": CrabWarningCategory.LowCpuEfficiency,
   }
@@ -114,11 +118,14 @@ class LogEntryParser:
         task_status.status = Status.InProgress
       if task_status.status_on_server == StatusOnServer.KILLED:
         task_status.status = Status.WaitingForRecovery
+      if task_status.status_on_scheduler == StatusOnScheduler.WAITING_FOR_BOOTSTRAP:
+        task_status.status = Status.Submitted
       if task_status.status_on_scheduler in [ StatusOnScheduler.FAILED, StatusOnScheduler.FAILED_KILLED ]:
         task_status.status = Status.WaitingForRecovery
       if task_status.status_on_scheduler == StatusOnScheduler.COMPLETED:
         task_status.status = Status.CrabFinished
-      if task_status.status_on_server in [ StatusOnServer.SUBMITFAILED, StatusOnServer.RESUBMITFAILED ]:
+      if task_status.status_on_server in [ StatusOnServer.SUBMITFAILED, StatusOnServer.RESUBMITFAILED,
+                                           StatusOnServer.KILLFAILED ]:
         task_status.status = Status.WaitingForRecovery
     except RuntimeError as e:
       task_status.status = Status.Unknown
@@ -136,6 +143,8 @@ class LogEntryParser:
   def status_on_server(task_status, log_lines, n, value):
     if value == "QUEUED on command SUBMIT":
       task_status.status_on_server = StatusOnServer.QUEUED
+    elif value == "TAPERECALL on command SUBMIT":
+      task_status.status_on_server = StatusOnServer.TAPERECALL
     else:
       if value not in StatusOnServer.__members__:
         raise RuntimeError(f'Unknown status on the CRAB server = "{value}"')
@@ -162,8 +171,7 @@ class LogEntryParser:
     warning_text = value
     while n < len(log_lines) - 1:
       n += 1
-      line = log_lines[n].strip()
-      if len(line) == 0 or log_lines[n][0] != ' ':
+      if len(log_lines[n]) == 0 or log_lines[n][0] != ' ':
         break
       warning_text += f'\n{log_lines[n].strip()}'
     task_status.warnings.append(CrabWarning(warning_text))
@@ -174,9 +182,9 @@ class LogEntryParser:
     while n < len(log_lines) - 1:
       n += 1
       line = log_lines[n].strip()
-      if len(line) == 0 or log_lines[n][0] != ' ':
-        break
-      text += f'\n{log_lines[n].strip()}'
+      if len(line) == 0: continue
+      if log_lines[n][0] not in [ ' ', '\t' ]: break
+      text += f'\n{line}'
     task_status.failure = CrabFailure(text)
     return n
 
@@ -303,6 +311,11 @@ class LogEntryParser:
       n += 1
     return n
 
+  def waiting_for_bootstrap(task_status, log_lines, n, value):
+    task_status.status_on_scheduler = StatusOnScheduler.WAITING_FOR_BOOTSTRAP
+    return n + 1
+
+
   def details(task_status, log_entries, n, value):
     task_status.details = json.loads(log_entries[n])
     return n + 1
@@ -326,7 +339,8 @@ class LogEntryParser:
     "Failure message from server:": failure,
     "{": details,
     "The task failed to bootstrap on the Grid scheduler": bootstrap_failed,
-    "Rucio client intialized for account": "account"
+    "Rucio client intialized for account": "account",
+    "Waiting for the Grid scheduler to bootstrap your task": waiting_for_bootstrap,
   }
   error_summary_end = "Have a look at https://twiki.cern.ch/twiki/bin/viewauth/CMSPublic/JobExitCodes for a description of the exit codes."
   status_will_be_available = "Status information will be available within a few minutes"
@@ -373,7 +387,8 @@ class CrabTaskStatus:
   def get_job_status(self):
     jobs = {}
     for job_id, job_stat in self.details.items():
-      status = JobStatus[job_stat["State"]]
+      state_str = job_stat["State"]
+      status = JobStatus[state_str] if len(state_str) > 0 else JobStatus.unknown
       jobs[job_id] = status
     return jobs
 

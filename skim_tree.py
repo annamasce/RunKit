@@ -115,12 +115,19 @@ def get_columns(df):
 
 def skim_tree(inputs, input_tree, output, output_tree, input_range, output_range, snapshot_options,
               column_filters, sel, invert_sel, processing_module, processing_function, verbose=0):
-  if len(inputs) == 0:
+
+  def create_empty_file(msg):
     if verbose > 0:
-      print(f'No inputs files to skim "input_tree". An empty output file will be created.')
-    compression_settings = snapshot_options.fCompressionAlgorithm * 100 + snapshot_options.fCompressionLevel
-    output_file = ROOT.TFile.Open(output, 'RECREATE', '', compression_settings)
-    output_file.Close()
+      print(msg)
+    if not os.path.exists(output):
+      if verbose > 0:
+        print('Creating an empty output file.')
+      compression_settings = snapshot_options.fCompressionAlgorithm * 100 + snapshot_options.fCompressionLevel
+      output_file = ROOT.TFile.Open(output, 'RECREATE', '', compression_settings)
+      output_file.Close()
+
+  if len(inputs) == 0:
+    create_empty_file(f'No inputs files to skim {input_tree}.')
     return
 
   df = ROOT.RDataFrame(input_tree, inputs)
@@ -135,6 +142,10 @@ def skim_tree(inputs, input_tree, output, output_tree, input_range, output_range
 
   all_columns, column_types = get_columns(df)
   selected_columns = select_items(all_columns, column_filters, verbose=verbose)
+
+  if len(selected_columns) == 0:
+    create_empty_file(f'No columns were selected to skim {input_tree}.')
+    return
 
   branches = ROOT.vector('string')()
   for column in all_columns:
@@ -230,7 +241,7 @@ if __name__ == "__main__":
   parser.add_argument('--output-range', required=False, type=str, default=None,
                       help="write only entries in range begin:end (after all selections)")
   parser.add_argument('--update-output', action="store_true", help="Update output file instead of overriding it.")
-  parser.add_argument('--verbose', required=False, type=int, default=3, help="number of threads")
+  parser.add_argument('--verbose', required=False, type=int, default=3, help="verbosity level")
   args = parser.parse_args()
 
   all_inputs = []

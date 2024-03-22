@@ -1,21 +1,26 @@
+import copy
+import datetime
 import json
 import law
 import luigi
 import os
+import select
 import shutil
+import sys
 import tempfile
+import termios
 import threading
 
 from .law_customizations import HTCondorWorkflow
 from .crabTask import Task as CrabTask
 from .crabTaskStatus import Status
-from .sh_tools import sh_call
+from .run_tools import ps_call, print_ts
 
 cond = threading.Condition()
 
 def update_kinit(verbose=0):
   if shutil.which('kinit'):
-    sh_call(['kinit', '-R'], expected_return_codes=None, verbose=verbose)
+    ps_call(['kinit', '-R'], expected_return_codes=None, verbose=verbose)
 
 def update_kinit_thread():
   timeout = 60.0 * 60 # 1 hour
@@ -24,8 +29,92 @@ def update_kinit_thread():
     update_kinit(verbose=1)
   cond.release()
 
+class LawTaskManager:
+  def __init__(self, cfg_path):
+    self.cfg_path = cfg_path
+    if os.path.exists(cfg_path):
+      with open(cfg_path, 'r') as f:
+        self.cfg = json.load(f)
+      self.has_updates = False
+    else:
+      self.cfg = []
+      self.has_updates = True
+
+  def add(self, task_work_area, task_grid_job_id, done_flag):
+    task_work_area = os.path.abspath(task_work_area)
+    done_flag = os.path.abspath(done_flag)
+    if self.find(task_work_area, task_grid_job_id) >= 0:
+      return
+    branch_id = len(self.cfg)
+    self.cfg.append({ 'branch_id': branch_id, 'task_work_area': task_work_area,
+                      'task_grid_job_id': task_grid_job_id, 'done_flag': done_flag })
+    self.has_updates = True
+
+  def find(self, task_work_area, task_grid_job_id):
+    for entry in self.cfg:
+      if entry['task_work_area'] == task_work_area and entry['task_grid_job_id'] == task_grid_job_id:
+        return entry['branch_id']
+    return -1
+
+  def get_cfg(self):
+    cfg_ext = []
+    entry_jobs = {}
+    special_job = -1
+    for entry in self.cfg:
+      entry_ext = copy.deepcopy(entry)
+      entry_ext['dependencies'] = []
+      task_work_area = entry_ext['task_work_area']
+      task_grid_job_id = entry_ext['task_grid_job_id']
+      if task_work_area not in entry_jobs:
+        entry_jobs[task_work_area] = {}
+      entry_jobs[task_work_area][task_grid_job_id] = entry_ext
+      cfg_ext.append(entry_ext)
+    for task_work_area, jobs in entry_jobs.items():
+      if special_job in jobs:
+        special_entry = jobs[special_job]
+        for task_grid_job_id, entry in jobs.items():
+          if task_grid_job_id != special_job:
+            special_entry['dependencies'].append(entry['done_flag'])
+    return cfg_ext
+
+  def select_branches(self, task_work_areas):
+    selected_branches = []
+    for task_work_area in task_work_areas:
+      task_work_area = os.path.abspath(task_work_area)
+      for entry in self.cfg:
+        if entry['task_work_area'] == task_work_area:
+          selected_branches.append(entry['branch_id'])
+    return selected_branches
+
+  def _save_safe(self, file, json_content):
+    tmp_path = file + '.tmp'
+    with open(tmp_path, 'w') as f:
+      json.dump(json_content, f, indent=2)
+    shutil.move(tmp_path, file)
+
+  def save(self):
+    if self.has_updates:
+      self._save_safe(self.cfg_path, self.cfg)
+      self.has_updates = False
+
+  def update_grid_jobs(self, grid_jobs_file):
+    if not os.path.exists(grid_jobs_file):
+      return
+    with open(grid_jobs_file, 'r') as f:
+      grid_jobs = json.load(f)
+    has_updates = False
+    for entry in self.cfg:
+      branch_id = entry['branch_id']
+      job_id = str(branch_id + 1)
+      if job_id not in grid_jobs["jobs"] and job_id not in grid_jobs["unsubmitted_jobs"]:
+        grid_jobs["unsubmitted_jobs"][job_id] = [  branch_id ]
+        has_updates = True
+    if has_updates:
+      self._save_safe(grid_jobs_file, grid_jobs)
+
 class ProdTask(HTCondorWorkflow, law.LocalWorkflow):
   work_area = luigi.Parameter()
+  stop_date = luigi.parameter.DateSecondParameter(default=datetime.datetime.max)
 
   def local_path(self, *path):
     return os.path.join(self.htcondor_output_directory().path, *path)
@@ -43,50 +132,52 @@ class ProdTask(HTCondorWorkflow, law.LocalWorkflow):
     return tempfile.mkdtemp(dir=self.local_path()), True
 
   def create_branch_map(self):
-    task_list_path = os.path.join(self.work_area, 'tasks.json')
-    with open(task_list_path, 'r') as f:
-      task_names = json.load(f)
+    task_list_path = os.path.join(self.work_area, 'law_tasks.json')
+    task_manager = LawTaskManager(task_list_path)
     branches = {}
-    job_id = 0
-    for task_name in task_names:
-      task = CrabTask.Load(mainWorkArea=self.work_area, taskName=task_name)
-      if task.taskStatus.status in [ Status.CrabFinished, Status.PostProcessingFinished ]:
-        branches[job_id] = (task.workArea, -1, task.getPostProcessingDoneFlagFile())
-        job_id += 1
-      else:
-        for grid_job_id in task.getGridJobs():
-          branches[job_id] = (task.workArea, grid_job_id, task.getGridJobDoneFlagFile(grid_job_id))
-          job_id += 1
+    for entry in task_manager.get_cfg():
+      branches[entry['branch_id']] = (entry['task_work_area'], entry['task_grid_job_id'], entry['done_flag'], entry['dependencies'])
     return branches
 
   def output(self):
-    work_area, grid_job_id, done_flag = self.branch_data
-    return law.LocalFileTarget(done_flag)
+    work_area, grid_job_id, done_flag, dependencies = self.branch_data
+    done_flag_target = law.LocalFileTarget(done_flag)
+    wait_flag_target = law.LocalFileTarget(done_flag + '.wait')
+    for dependency in dependencies:
+      if not os.path.exists(dependency):
+        wait_flag_target.touch()
+        return wait_flag_target
+    return done_flag_target
 
   def run(self):
     thread = threading.Thread(target=update_kinit_thread)
     thread.start()
+    job_home, remove_job_home = self.law_job_home()
     try:
-      work_area, grid_job_id, done_flag = self.branch_data
+      work_area, grid_job_id, done_flag, dependencies = self.branch_data
       task = CrabTask.Load(workArea=work_area)
       if grid_job_id == -1:
         if task.taskStatus.status in [ Status.CrabFinished, Status.PostProcessingFinished ]:
           if task.taskStatus.status == Status.CrabFinished:
             print(f'Post-processing {task.name}')
-            task.postProcessOutputs()
+            task.postProcessOutputs(job_home)
           self.output().touch()
         else:
           raise RuntimeError(f"task {task.name} is not ready for post-processing")
       else:
-        print(f'Running {task.name} job_id = {grid_job_id}')
-        job_home, remove_job_home = self.law_job_home()
-        result = task.runJobLocally(grid_job_id, job_home)
+        if grid_job_id in task.getGridJobs():
+          print(f'Running {task.name} job_id = {grid_job_id}')
+          result = task.runJobLocally(grid_job_id, job_home)
+          print(f'Finished running {task.name} job_id = {grid_job_id}. result = {result}')
+        else:
+          print(f'job_id = {grid_job_id} is not found in {task.name}. considering it as finished')
+          result = True
         state_str = 'finished' if result else 'failed'
-        if remove_job_home:
-          shutil.rmtree(job_home)
         with self.output().open('w') as output:
           output.write(state_str)
     finally:
+      if remove_job_home:
+        shutil.rmtree(job_home)
       cond.acquire()
       cond.notify_all()
       cond.release()
@@ -94,3 +185,18 @@ class ProdTask(HTCondorWorkflow, law.LocalWorkflow):
 
   def poll_callback(self, poll_data):
     update_kinit(verbose=0)
+    rlist, wlist, xlist = select.select([sys.stdin], [], [], 0.1)
+    if rlist:
+      termios.tcflush(sys.stdin, termios.TCIOFLUSH)
+      timeout = 10 # seconds
+      print_ts('Input from terminal is detected. Press return to stop polling, otherwise polling will'
+               f' continue in {timeout} seconds...')
+      rlist, wlist, xlist = select.select([sys.stdin], [], [], timeout)
+      if rlist:
+        termios.tcflush(sys.stdin, termios.TCIOFLUSH)
+        return False
+      print_ts(f'Polling resumed')
+    return datetime.datetime.now() < self.stop_date
+
+  def control_output_postfix(self):
+    return ""
